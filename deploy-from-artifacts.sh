@@ -1,0 +1,148 @@
+#!/bin/bash
+set -e
+
+GITHUB_TOKEN="${GITHUB_TOKEN:?Error: GITHUB_TOKEN env variable is not set. Run: export GITHUB_TOKEN=your_token}"
+WORK_DIR="/tmp/shopizer-deploy"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p $WORK_DIR
+
+log() { echo "[$(date '+%H:%M:%S')] $1"; }
+
+# ── Pre-flight checks ──────────────────────────────────────────────────────────
+if ! command -v colima &>/dev/null; then
+  echo "❌ colima not found. Install with: brew install colima"; exit 1
+fi
+if ! colima status 2>/dev/null | grep -q "Running"; then
+  log "Colima not running. Starting..."
+  colima start --cpu 4 --memory 8
+fi
+if ! command -v docker &>/dev/null; then
+  echo "❌ docker not found. Install with: brew install docker"; exit 1
+fi
+if ! command -v docker-compose &>/dev/null && ! docker compose version &>/dev/null 2>&1; then
+  echo "❌ docker compose not found. Install with: brew install docker-compose"; exit 1
+fi
+
+# ── Helper: download artifact from GitHub ─────────────────────────────────────
+download_artifact() {
+  local REPO=$1 RUN_ID=$2 ARTIFACT_NAME=$3 DEST=$4
+
+  if [ -f "$WORK_DIR/$ARTIFACT_NAME.zip" ]; then
+    log "⏭️  $ARTIFACT_NAME already downloaded, skipping..."
+    mkdir -p "$DEST"
+    unzip -q -o "$WORK_DIR/$ARTIFACT_NAME.zip" -d "$DEST"
+    return
+  fi
+
+  log "Downloading $ARTIFACT_NAME from $REPO (run $RUN_ID)..."
+  
+  ARTIFACT_RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    "https://api.github.com/repos/pranjal-gupta-dev/$REPO/actions/runs/$RUN_ID/artifacts")
+  
+  if echo "$ARTIFACT_RESPONSE" | grep -q "Bad credentials"; then
+    echo "❌ GitHub token invalid or expired"; exit 1
+  fi
+  
+  ARTIFACT_ID=$(echo "$ARTIFACT_RESPONSE" | \
+    python3 -c "import sys,json; arts=json.load(sys.stdin)['artifacts']; print(next((a['id'] for a in arts if a['name']=='$ARTIFACT_NAME'), ''))")
+  
+  if [ -z "$ARTIFACT_ID" ]; then
+    echo "❌ Artifact '$ARTIFACT_NAME' not found in run $RUN_ID"; exit 1
+  fi
+
+  curl -L -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/pranjal-gupta-dev/$REPO/actions/artifacts/$ARTIFACT_ID/zip" \
+    -o "$WORK_DIR/$ARTIFACT_NAME.zip"
+  
+  if [ ! -f "$WORK_DIR/$ARTIFACT_NAME.zip" ] || [ ! -s "$WORK_DIR/$ARTIFACT_NAME.zip" ]; then
+    echo "❌ Failed to download artifact"; exit 1
+  fi
+
+  mkdir -p "$DEST"
+  unzip -q -o "$WORK_DIR/$ARTIFACT_NAME.zip" -d "$DEST"
+  log "✅ $ARTIFACT_NAME downloaded"
+}
+
+# ── Get latest successful CI run IDs ──────────────────────────────────────────
+log "Fetching latest CI run IDs..."
+BACKEND_RUN=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+  "https://api.github.com/repos/pranjal-gupta-dev/shopizer/actions/workflows/ci-cd.yml/runs?status=success&per_page=1" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['id'])")
+
+STOREFRONT_RUN=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+  "https://api.github.com/repos/pranjal-gupta-dev/shopizer-shop-reactjs/actions/workflows/ci-cd.yml/runs?status=success&per_page=1" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['id'])")
+
+ADMIN_RUN=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+  "https://api.github.com/repos/pranjal-gupta-dev/shopizer-admin/actions/workflows/ci-cd.yml/runs?status=success&per_page=1" | \
+  python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['id'])")
+
+log "Backend run: $BACKEND_RUN | Storefront run: $STOREFRONT_RUN | Admin run: $ADMIN_RUN"
+
+# ── Download artifacts ─────────────────────────────────────────────────────────
+download_artifact "shopizer"              $BACKEND_RUN    "shopizer-jar"        "$WORK_DIR/backend"
+download_artifact "shopizer-shop-reactjs" $STOREFRONT_RUN "shop-build"          "$WORK_DIR/storefront"
+download_artifact "shopizer-admin"        $ADMIN_RUN      "shopizer-admin-dist" "$WORK_DIR/admin"
+
+# ── Build backend image ────────────────────────────────────────────────────────
+log "Building backend image..."
+mkdir -p $WORK_DIR/backend-ctx/target $WORK_DIR/backend-ctx/files
+cp $WORK_DIR/backend/shopizer.jar $WORK_DIR/backend-ctx/target/
+cat > $WORK_DIR/backend-ctx/Dockerfile <<'DOCKERFILE'
+FROM eclipse-temurin:17-jre
+RUN mkdir /opt/app /files
+COPY target/shopizer.jar /opt/app
+COPY ./files /files
+CMD ["java", "-jar", "/opt/app/shopizer.jar"]
+DOCKERFILE
+docker build $WORK_DIR/backend-ctx -t shopizer-backend:local
+
+# ── Build storefront image ─────────────────────────────────────────────────────
+log "Building storefront image..."
+mkdir -p $WORK_DIR/storefront-ctx/build $WORK_DIR/storefront-ctx/conf/conf.d
+cp -r $WORK_DIR/storefront/. $WORK_DIR/storefront-ctx/build/
+curl -sL "https://raw.githubusercontent.com/pranjal-gupta-dev/shopizer-shop-reactjs/main/env.sh" -o $WORK_DIR/storefront-ctx/env.sh
+curl -sL "https://raw.githubusercontent.com/pranjal-gupta-dev/shopizer-shop-reactjs/main/.env" -o $WORK_DIR/storefront-ctx/.env
+curl -sL "https://raw.githubusercontent.com/pranjal-gupta-dev/shopizer-shop-reactjs/main/conf/conf.d/default.conf" -o $WORK_DIR/storefront-ctx/conf/conf.d/default.conf
+cat > $WORK_DIR/storefront-ctx/Dockerfile <<'DOCKERFILE'
+FROM nginx:stable-alpine
+RUN rm -rf /etc/nginx/conf.d
+COPY conf /etc/nginx
+COPY build /usr/share/nginx/html
+RUN apk add --no-cache bash
+COPY env.sh /usr/share/nginx/html/env.sh
+COPY .env /usr/share/nginx/html/.env
+RUN chmod +x /usr/share/nginx/html/env.sh
+EXPOSE 80
+CMD ["/bin/bash", "-c", "/usr/share/nginx/html/env.sh && nginx -g 'daemon off;'"]
+DOCKERFILE
+docker build $WORK_DIR/storefront-ctx -t shopizer-storefront:local
+
+# ── Build admin image ──────────────────────────────────────────────────────────
+log "Building admin image..."
+mkdir -p $WORK_DIR/admin-ctx/dist
+cp -r $WORK_DIR/admin/. $WORK_DIR/admin-ctx/dist/
+curl -sL "https://raw.githubusercontent.com/pranjal-gupta-dev/shopizer-admin/main/docker/nginx.conf" -o $WORK_DIR/admin-ctx/nginx.conf
+cat > $WORK_DIR/admin-ctx/Dockerfile <<'DOCKERFILE'
+FROM nginx:alpine
+COPY dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+CMD ["/bin/sh", "-c", "envsubst < /usr/share/nginx/html/assets/env.template.js > /usr/share/nginx/html/assets/env.js && exec nginx -g 'daemon off;'"]
+DOCKERFILE
+docker build $WORK_DIR/admin-ctx -t shopizer-admin:local
+
+# ── Deploy with Docker Compose ─────────────────────────────────────────────────
+log "Deploying with Docker Compose..."
+cd "$SCRIPT_DIR"
+if docker compose version &>/dev/null 2>&1; then
+  docker compose up -d --force-recreate
+  docker compose ps
+else
+  docker-compose up -d --force-recreate
+  docker-compose ps
+fi
+echo ""
+echo "Backend:    http://localhost:8080/api/v1/store/DEFAULT"
+echo "Storefront: http://localhost:3000"
+echo "Admin:      http://localhost:4200"

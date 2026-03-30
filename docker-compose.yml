@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: shopizer-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: SALESMANAGER
+      MYSQL_USER: shopizer
+      MYSQL_PASSWORD: very-long-shopizer-password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - shopizer-network
+
+  backend:
+    image: shopizer-backend:local
+    container_name: shopizer-backend
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=mysql
+      - db.jdbcUrl=jdbc:mysql://mysql:3306/SALESMANAGER?useUnicode=true&characterEncoding=UTF-8&serverTimezone=UTC
+      - db.user=shopizer
+      - db.password=very-long-shopizer-password
+      - db.driverClass=com.mysql.cj.jdbc.Driver
+      - hibernate.dialect=org.hibernate.dialect.MySQL8Dialect
+      - hibernate.hbm2ddl.auto=create
+      - db.schema=SALESMANAGER
+      - db.show.sql=true
+      - POPULATE_TEST_DATA=true
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - shopizer-network
+
+  frontend:
+    image: shopizer-storefront:local
+    container_name: shopizer-frontend
+    ports:
+      - "3000:80"
+    environment:
+      - APP_BASE_URL=http://localhost:8080
+    depends_on:
+      - backend
+    networks:
+      - shopizer-network
+
+  admin:
+    image: shopizer-admin:local
+    container_name: shopizer-admin
+    ports:
+      - "4200:80"
+    environment:
+      - APP_BASE_URL=http://localhost:8080/api
+      - APP_SHIPPING_URL=http://localhost:9090/api
+      - APP_DEFAULT_LANGUAGE=en
+    depends_on:
+      - backend
+    networks:
+      - shopizer-network
+
+volumes:
+  mysql_data:
+
+networks:
+  shopizer-network:
+    driver: bridge
